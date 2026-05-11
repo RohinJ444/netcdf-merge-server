@@ -15,7 +15,7 @@ The merge combines compatible NetCDF structure and data, including dimensions, g
 5. [Parallelism](#parallelism)
 6. [Running, Curl Usage, and Testing](#running-curl-usage-and-testing)
 7. [Test Coverage](#test-coverage)
-8. [Limitations](#limitations)
+8. [Limitations and Future Directions](#limitations-and-future-directions)
 9. [Resources and Acknowledgments](#resources-and-acknowledgments)
 
 ## Project Structure
@@ -35,32 +35,28 @@ The merge combines compatible NetCDF structure and data, including dimensions, g
 
 ### `src/main.rs`
 
-`main.rs` contains the Rocket server setup, route handlers, upload validation, and shared in-memory upload store.
+`main.rs` contains the Rocket server setup, route handlers, upload validation, and persisted in-memory `HashMap`.
 
 It defines four API routes:
 
-* `GET /`
-* `POST /part_a?name=<name>`
-* `POST /part_b?name=<name>`
-* `GET /read?name=<name>`
+- `GET /`
+- `POST /part_a?name=<name>`
+- `POST /part_b?name=<name>`
+- `GET /read?name=<name>`
 
-Uploaded files are stored as `Vec<u8>` values in a `HashMap` keyed by `name`. Each name has one optional `part_a` and one optional `part_b`. The map is wrapped in a Tokio `RwLock` so the Rocket handlers can use it as shared application state while the server is running.
+The central server state is a `HashMap` keyed by `name`. Each `name` maps to a `Parts` struct, which stores the current `part_a` bytes and current `part_b` bytes as optional `Vec<u8>` values. They are optional because a client can upload one side before the other. The map is wrapped in a Tokio `RwLock` so Rocket request handlers can share it while the server process is running.
 
 Re-uploading one side under an existing name replaces that side of the pair. For example, if `part_a` and `part_b` have both been uploaded under `name=test`, a later upload to `POST /part_b?name=test` replaces only `part_b`; the existing `part_a` remains stored.
 
-Before an upload is stored, `main.rs` validates that the bytes can be opened as NetCDF and that the file format is NetCDF-4 or NetCDF-4 classic. Non-NetCDF files, NetCDF-3 files, and CDF-5 files are rejected before they enter the store.
+Before an upload is stored, `main.rs` validates that the bytes can be opened as NetCDF and that the file format is NetCDF-4 or NetCDF-4 classic. 
 
 ### `src/merge.rs`
 
-`merge.rs` is the internal merge implementation used by `main.rs`. I kept it separate so the Rocket request handling stays separate from the low-level NetCDF-C work.
+`merge.rs` is the internal merge module called by `main.rs`. Its public entry point, `combine_netcdf4_in_memory`, takes the uploaded `part_a` and `part_b` byte slices and returns the merged NetCDF-4 bytes.
 
-The file crosses from Rust into NetCDF-C through Rust's foreign function interface (FFI). The public entry point, `combine_netcdf4_in_memory`, is safe to call from the rest of the server. It acquires the global merge lock, then calls a private unsafe helper where the direct NetCDF-C calls happen.
+That function opens both inputs from memory, creates the output dataset in memory, copies dimensions and global attributes, defines output variables, leaves NetCDF define mode, then copies variable data into the output file. The direct NetCDF-C calls are kept inside private unsafe helpers, and the public function acquires a global lock before entering them, so the server code only needs to call one safe merge function.
 
-The unsafe helper uses three NetCDF-C memory functions. `nc_open_mem` opens the two uploaded files from caller-provided memory buffers. `nc_create_mem` creates the merged output file in memory. `nc_close_memio` closes the output dataset and returns the completed output memory buffer. Since that returned buffer is owned by C, the Rust code copies it into a Rust-owned `Vec<u8>` and then frees the original C-owned memory.
-
-The rest of `merge.rs` is made up of smaller helper functions for copying dimensions, global attributes, variable definitions, variable attributes, and variable data. Those helpers also keep NetCDF-C pointer setup and status-code error handling out of the main merge flow.
-
-I considered naming this file `merge_utils.rs`, but I think `merge.rs` is more accurate. It is not just miscellaneous utility code; it contains the actual merge path plus the helpers needed to keep that path readable.
+I describe the lower-level memory flow in more detail in [In-Memory Design](#in-memory-design).
 
 ### `scripts/create_test_data.py`
 
@@ -85,46 +81,60 @@ This section offers a brief summary of the available endpoints. For step-by-step
 
 ## In-Memory Design
 
-The main design goal was to avoid writing NetCDF payloads to disk. Rocket reads the request body into memory, and the upload handler stores those bytes directly as a `Vec<u8>`. No temporary NetCDF file is created for validation or later merging.
+The main implementation constraint was to avoid disk I/O for the uploaded and merged NetCDF files: no saving uploaded files to temporary paths, and no creating the merged output as a temporary file before returning it.
 
-When `/read` is called, the server retrieves the two stored byte vectors and passes them to `combine_netcdf4_in_memory`. `merge.rs` then opens those byte vectors with `nc_open_mem`. NetCDF-C gives each opened in-memory dataset an integer ID, and later calls use those IDs to inspect dimensions, attributes, variables, and data.
+Rust does not provide a NetCDF memory-merge API directly, so the merge uses NetCDF-C's in-memory API through `netcdf_sys`. That API supports the operations needed for the no-payload-disk-I/O constraint: opening an existing NetCDF file from a memory buffer, creating a new output NetCDF file in memory, and retrieving the completed output buffer after closing it.
 
-The output file is created with `nc_create_mem`, also in memory. After the output dimensions, attributes, variables, and data are written, `nc_close_memio` returns the completed merged file as a C-owned memory buffer. The Rust code copies that final buffer into a Rust-owned `Vec<u8>`, frees the C-owned buffer, and returns the Rust vector through Rocket.
+The NetCDF-C functions I used are:
 
-The path is:
+- [`nc_open_mem`](https://docs.unidata.ucar.edu/netcdf-c/current/netcdf__mem_8h.html): opens a NetCDF file with contents taken from a memory block.
+- [`nc_create_mem`](https://docs.unidata.ucar.edu/netcdf-c/current/netcdf__mem_8h.html): creates a NetCDF file with contents stored in memory.
+- [`nc_close_memio`](https://docs.unidata.ucar.edu/netcdf-c/current/netcdf__mem_8h.html): closes an in-memory dataset and returns the final memory contents.
 
-```text
-HTTP request body
-→ Rust Vec<u8> in the upload store
-→ nc_open_mem for both inputs
-→ nc_create_mem for the output dataset
-→ NetCDF-C copy operations
-→ nc_close_memio returns the completed output buffer
-→ Rust Vec<u8>
-→ Rocket response body
+The algorithm for the merge is therefore:
+
+1. Rocket reads each upload body into memory.
+2. The upload handler stores each file as a `Vec<u8>` in the persisted `HashMap`.
+3. `/read` retrieves the stored `part_a` and `part_b` byte vectors for the requested name.
+4. `merge.rs` passes those byte buffers into `nc_open_mem`.
+5. `merge.rs` creates the output dataset with `nc_create_mem`.
+6. The merge code copies dimensions, attributes, variables, and data into the in-memory output dataset.
+7. `nc_close_memio` returns the completed NetCDF output buffer.
+8. Rust copies that C-owned buffer into a Rust-owned `Vec<u8>`, frees the C-owned memory, and returns the Rust vector through Rocket.
+
+### Verifying No File Disk I/Os
+
+After implementing and testing `merge.rs`, I wanted to verify that the server was actually meeting the no-payload-disk-I/O constraint. I used macOS filesystem tracing while running the server and issuing upload/read requests:
+
+
+```bash
+sudo fs_usage -w -f filesys <server_pid_or_process_name>
+sudo fs_usage -w -f diskio <server_pid_or_process_name>
 ```
 
-A confusing detail is that NetCDF-C's memory functions still take a parameter named `path`. In this implementation, those values are names like `memory_part_a`, `memory_part_b`, and `memory_combined`. They are required dataset names for the NetCDF-C API. The server code does not use them as paths for writing the NetCDF payload to disk.
+None of the filesystem activity I saw was the server reading or writing uploaded NetCDF files or merged NetCDF output. Most of it was the operating system paging dynamic libraries and other already-installed library code into memory while the server and NetCDF-C/HDF5 stack were running.
 
-While debugging, I used macOS filesystem tracing tools and saw some library-level behavior from NetCDF-C/HDF5, including dynamic library page-ins and failed path/config probes. I do not treat those as payload disk I/O. The uploaded and merged NetCDF file contents are handled through memory buffers rather than temporary NetCDF files.
+However, one peculiar pattern in the logs was that the NetCDF-C/HDF5 stack occasionally made pathname/config probes during the memory-backed open/create calls. Those attempts failed with errors such as `ENOENT`, and the merge still proceeded through the buffers passed into `nc_open_mem` and `nc_create_mem`.
+
+This is an artifact of the NetCDF-C memory API. The function signatures still include a `const char *path` parameter, even though `nc_open_mem` uses the caller-provided memory block as the file contents and `nc_create_mem` stores the created file in memory. In my code, I pass names like `memory_part_a`, `memory_part_b`, and `memory_combined` into that required `path` argument, and NetCDF-C stores that string as the name associated with the open dataset ID. My best read of the filesystem trace is that parts of the underlying stack still use that name during lower-level path/config probing, which would explain the failed `ENOENT` attempts. I did not trace this down to the specific call site in NetCDF-C/HDF5, so I am treating it as a hypothesis rather than a definitive internal explanation. I chose not to keep digging there because it would have meant stepping outside the server implementation and debugging the internals of large C/HDF5 dependencies, while the filesystem trace had already answered the question that mattered for this project: the uploaded and merged NetCDF files were not being read from or written to disk.
+
+See the NetCDF-C [`netcdf_mem.h` reference](https://docs.unidata.ucar.edu/netcdf-c/current/netcdf__mem_8h.html) and [in-memory support documentation](https://docs.unidata.ucar.edu/netcdf-c/current/inmemory.html).
 
 ## Merge Semantics
 
-A NetCDF dataset has three pieces that matter for this implementation:
+A NetCDF dataset has three components that matter for this implementation:
 
 1. Dimensions, which name and size axes like `time`, `lat`, or `lon`.
 2. Variables, which hold typed data and refer to dimensions.
 3. Attributes, which store metadata either globally for the whole file or locally on a specific variable.
 
-This implementation merges each of those pieces directly, one at a time.
-
-It does not try to infer scientific meaning from coordinate variables, align timesteps, or reconcile different grids.
+This implementation merges each of those pieces directly, one at a time. It copies structure and data as they already exist in the input files; it does not align coordinate variables, reconcile timesteps, concatenate along dimensions, or regrid data.
 
 ### General merge restrictions
 
 The server only accepts NetCDF-4 and NetCDF-4 classic input files. NetCDF-3, CDF-5, and any other file types are rejected at upload time.
 
-Variables are copied as-is. The implementation supports primitive numeric and char NetCDF types. It does not support strings, compound types, enum types, opaque types, variable-length arrays, groups, or other more complex NetCDF-4 features.
+Variables are copied as-is. The implementation supports primitive numeric NetCDF types, `NC_CHAR`, and `NC_STRING`. It does not support compound types, enum types, opaque types, variable-length arrays, groups, or other more complex NetCDF-4 features.
 
 Same-named dimensions must have the same length. Different dimension names can coexist in the output file.
 
@@ -132,7 +142,7 @@ Same-named dimensions must have the same length. Different dimension names can c
 
 For each source dimension, the merge reads the dimension's name and length. If the output file does not already have that dimension name, it defines a new output dimension. If the output already has that dimension name with the same length, it reuses the existing output dimension. If the output already has that dimension name with a different length, the merge fails.
 
-This succeeds:
+This succeeds, as the dimension names and lengths are consistent across both files:
 
 ```text
 part_a:
@@ -144,14 +154,9 @@ part_b:
   time = 2
   lat = 4
   lon = 3
-
-combined:
-  time = 2
-  lat = 4
-  lon = 3
 ```
 
-This fails:
+This fails, as the dimension name is shared but the lengths disagree:
 
 ```text
 part_a:
@@ -160,8 +165,6 @@ part_a:
 part_b:
   time = 5
 ```
-
-Both files define `time`, but they disagree on its length.
 
 ### Global attributes
 
@@ -195,7 +198,11 @@ combined:
   temperature(time)    # from part_a
 ```
 
-Once all variables are defined, the output file leaves define mode. The merge then copies variable data. For each variable, it calculates how many bytes are needed for the full variable, reads the source variable into a temporary byte buffer, and writes that buffer into the corresponding output variable.
+Once all variables are defined, the output file leaves define mode. The merge then copies variable data.
+
+For primitive numeric variables and `NC_CHAR`, the implementation calculates how many bytes are needed for the full variable, reads the source variable into a temporary byte buffer, and writes that buffer into the corresponding output variable.
+
+`NC_STRING` variables use NetCDF-C's string-specific API instead. String values are not copied as one fixed-width byte buffer; the implementation reads the string pointers through `nc_get_var_string`, writes them through `nc_put_var_string`, and frees the C-allocated string memory with `nc_free_string`.
 
 ### Upload overwrite behavior
 
@@ -216,41 +223,13 @@ POST /part_b?name=example   with overwrite_b.nc
 GET  /read?name=example
 ```
 
-The next `/read` returns `part_a.nc + overwrite_b.nc`. The integration tests check this by confirming that the first merge contains `temperature` and `humidity`, then re-uploading only `part_b`, then confirming that the next merge contains `temperature` and `pressure` instead.
-
-## Parallelism
-
-The current implementation keeps the request-facing server and the merge path separate. Rocket can still receive independent requests, and the upload store is protected by a Tokio `RwLock`. The part I deliberately serialize is the direct NetCDF-C/HDF5 merge. Before entering that code, `combine_netcdf4_in_memory` acquires a global mutex.
-
-### What is safe to parallelize
-
-The ordinary HTTP work is parallelizable: receiving requests, reading request bodies, validating uploads, storing byte vectors by name, and returning response bytes. Those pieces are normal Rust/Rocket server work.
-
-The merge itself is the sensitive part. NetCDF-4 files are HDF5-backed, and this server enters that stack through C library calls. HDF5's thread-safe build model uses a global lock around entry into the library. The HDF5 multi-threading RFC describes this as allowing only one thread into the library at a time in the thread-safe build. I mirrored that model by using one global merge lock around the NetCDF-C/HDF5 merge path.
-
-### Why NetCDF parallelism is tricky here
-
-NetCDF-C has parallel I/O support, but it is not the same problem as this server's in-memory merge.
-
-For NetCDF-4 files, parallel I/O is built around the HDF5 parallel model. For classic CDF-style files, parallel access goes through PnetCDF, the Parallel-NetCDF library. PnetCDF is built on MPI-IO, where MPI means Message Passing Interface: a standard used by multiple processes in high-performance computing to coordinate work and I/O.
-
-That machinery is useful when a program is already written as a coordinated parallel application, often running across multiple processes. This server is different. It receives two complete uploaded files as HTTP request bodies, opens them from memory, and returns one merged output. The challenge is less about parallel disk reads and more about avoiding unsafe overlap inside the NetCDF-C/HDF5 stack while still allowing the server to handle requests cleanly.
-
-### What I would do next
-
-For a higher-throughput version, I would avoid running multiple NetCDF-C/HDF5 merges concurrently inside one process. I would keep Rocket responsible for HTTP, validation, and upload storage, then move merge work into isolated workers.
-
-A practical version would use a bounded worker process pool. Each worker process would receive one merge job, run one NetCDF-C/HDF5 merge, and return the completed bytes to the Rocket process. In Rust, the process boundary could be built with `std::process::Command` or a small internal worker binary. If I only wanted to move blocking work off the async runtime without process isolation, Tokio's `spawn_blocking` would be relevant, but I would still keep the global NetCDF-C/HDF5 merge lock unless I had very strong evidence that the specific library build and access pattern were safe without it.
-
-I would also add per-name coordination. A production version should make sure that a `GET /read?name=...` sees a consistent pair of bytes and cannot race with a simultaneous overwrite of `part_a` or `part_b` for the same name. A simple first step would be to clone both byte vectors for a name while holding the store lock, release the store lock, then merge that snapshot. For heavier use, I would add per-name locks, request size limits, old-upload cleanup, and worker-process isolation for merge jobs.
-
-Relevant references for this direction include the HDF5 thread-safe library documentation, the HDF5 multi-threading RFC, Tokio's `spawn_blocking` documentation, and Rust's `std::process::Command` documentation.
+The next `/read` returns `part_a.nc + overwrite_b.nc`.
 
 ## Running, Curl Usage, and Testing
 
 These commands assume you are testing locally on port 8000.
 
-### 1. Install Cargo and Python dependencies
+### 1. Install Cargo, Python dependencies, and NetCDF command-line tools
 
 Install Rust/Cargo from the official Rust installation page if you do not already have it:
 
@@ -258,10 +237,16 @@ Install Rust/Cargo from the official Rust installation page if you do not alread
 https://www.rust-lang.org/tools/install
 ```
 
-Install the Python packages used by the fixture and test scripts:
+Install the Python packages used by the test-data and integration-test scripts:
 
 ```bash
 pip install netCDF4 numpy requests
+```
+
+If you are on macOS and want to inspect returned files with `ncdump`, install the NetCDF command-line tools with Homebrew:
+
+```bash
+brew install netcdf
 ```
 
 ### 2. Start the server
@@ -280,9 +265,9 @@ http://127.0.0.1:8000
 
 Keep this terminal running.
 
-### 3. Try the server with curl
+### 3. Optional: try the server with your own files using curl
 
-In a second terminal, use your own NetCDF-4 files or generated fixtures. Replace the placeholder paths below with the files you want to upload.
+If you want to test the server manually with your own NetCDF-4 files, open a second terminal and replace the placeholder paths below with the files you want to upload.
 
 Upload `part_a`:
 
@@ -307,21 +292,19 @@ curl -o <path-to-output-combined.nc> \
   "http://127.0.0.1:8000/read?name=test"
 ```
 
-Inspect it if you have `ncdump` installed:
+Inspect it with `ncdump`:
 
 ```bash
 ncdump -h <path-to-output-combined.nc>
 ```
 
-### 4. Generate test data
+### 4. Generate test data files
 
 From the project root:
 
 ```bash
 python scripts/create_test_data.py
 ```
-
-This creates `test_data/`, which is ignored by Git because the files are generated.
 
 ### 5. Run the integration tests
 
@@ -330,6 +313,46 @@ With the server still running locally on port 8000:
 ```bash
 python scripts/run_integration_tests.py
 ```
+
+## Parallelism
+
+### Current synchronization model
+
+The current implementation has two separate synchronization points.
+
+First, the upload store is a persisted in-memory `HashMap` protected by a Tokio `RwLock`. That lets Rocket handle normal request-level concurrency: multiple requests can read from the store at the same time, while uploads that modify the store take write access.
+
+Second, the NetCDF-C/HDF5 merge is serialized with a global `Mutex`. Before `combine_netcdf4_in_memory` enters the low-level merge code, it takes that lock, so only one merge can run inside the process at a time.
+
+My decision to select that lock was based on the serialization model described in HDF5's [Thread Safe Library technical note](https://support.hdfgroup.org/releases/hdf5/v2_0/v2_0_0/documentation/doxygen/thread-safe-lib.html). In that model, a thread-safe build of HDF5 installs a recursive mutex around every library entry point, so only one thread is inside the library at a time. The default non-thread-safe build does not provide that protection. Since this server enters NetCDF-C/HDF5 through `netcdf-sys` and cannot assume how the linked HDF5 library was built, the Rust-side lock gives the merge code a consistent safety boundary before any NetCDF-C/HDF5 call.
+
+NetCDF's built-in parallel I/O is a different mechanism. [NetCDF-4 parallel I/O](https://docs.unidata.ucar.edu/netcdf-c/4.9.3/parallel_io.html) is built on HDF5's parallel mode and uses MPI (Message Passing Interface) for coordinated multi-process access to one shared file. That model is useful for HPC jobs where multiple processes collectively write chunks of a large dataset. However, this server has a different problem: each request gives the server two complete in-memory files, and the question is how to handle multiple independent merges safely.
+
+### What can be parallelized
+
+The HTTP side is straightforwardly parallelizable. Rocket can accept multiple connections, read request bodies, validate uploads, store bytes by name, and return response bytes without entering NetCDF-C/HDF5.
+
+The merge side is harder, and this is where HDF5's build configuration matters. HDF5, [documented by the HDF Group](https://confluence.hdfgroup.org/display/knowledge/Questions+about+thread-safety+and+concurrent+access), has three relevant build modes:
+
+- Default builds are not thread-safe at all. Concurrent calls can corrupt internal state, including file ID tables and dimension/variable lookup structures. The HDF Group notes that the pre-built binaries available for download are not thread-safe, which means most general-purpose distributions fall into this bucket unless rebuilt.
+- Thread-safe builds (`--enable-threadsafe`) install the recursive lock described above. Multiple threads can call into HDF5 safely, but only one is actually inside the library at a time. This is functionally equivalent to the explicit `Mutex` I am already using in Rust.
+- Parallel builds (`--enable-parallel`) link against MPI for the HPC use case described above and are not applicable to this server.
+
+So even a thread-safe HDF5 build does not give true concurrency for merges. The HDF Group's own [Toward Multi-Threaded Concurrency in HDF5](https://www.hdfgroup.org/wp-content/uploads/2022/05/Toward-MT-HDF5.pdf) document summarizes the current state plainly: the library is thread-safe but not concurrent. Work to change that is ongoing but is not part of any released version.
+
+Parallelizing within one merge would be even more fragile. NetCDF writes happen in phases: define dimensions and variables, leave define mode, then write data. The output dataset is one shared NetCDF-C/HDF5 object, so parallelizing variable copies would require careful coordination around define mode, IDs, memory ownership, and output mutation order.
+
+### What I would do next
+
+The first improvement I would make is snapshotting by name. When `/read?name=foo` is called, the server should clone the current `part_a` and `part_b` bytes for that name, then release the upload-store lock before running the merge. That would make each read operate on a consistent pair of inputs while keeping the expensive merge work outside the store lock.
+
+The next improvement would be per-name coordination. Uploads and reads for the same `name` should be coordinated, but unrelated names should not block each other at the server-state level. A read of `name=a` should not interfere with an upload to `name=b`.
+
+For true parallel merges, I would use process isolation rather than thread-level parallelism inside one process. Rocket would keep handling HTTP, validation, and upload storage. When a merge is needed, it would send the two byte buffers to a bounded pool of worker processes. Each worker would run one NetCDF-C/HDF5 merge at a time and return the completed bytes. That gives real parallelism across workers without asking multiple Rust threads to share one NetCDF-C/HDF5 library state inside the same process, and it also bounds the impact of any library bug or memory leak to a single worker.
+
+In Rust, that could be built with a small internal worker binary launched through [`std::process::Command`](https://doc.rust-lang.org/std/process/struct.Command.html), or with longer-running local workers communicating over pipes or sockets. A strictly weaker fallback would be [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html), but that would only keep Rocket's async runtime responsive. It would not give parallel merges as long as the global merge lock remains in place.
+
+A longer-running version of this server would also need request size limits, an eviction policy for stale uploads, and a per-name TTL on the store. None of those are concurrency fixes by themselves, but they matter for any server that is expected to stay up.
 
 ## Test Coverage
 
@@ -349,58 +372,88 @@ The current test suite covers the following cases:
 * `test_netcdf3_upload_returns_400`: uploads a valid NetCDF-3 file and checks that it is rejected because the server expects NetCDF-4.
 * `test_cdf5_upload_returns_400`: uploads a valid CDF-5 file and checks that it is rejected because the server expects NetCDF-4.
 * `test_large_merge`: repeats the compatible merge path with larger generated files.
+* `test_string_variables_merge`: uploads files with `NC_STRING` variables and checks that the returned file preserves the string variables, string attributes, and string values.
 
-The tests are not exhaustive. They do not currently cover groups, string variables, compound types, variable-length types, compression/chunking preservation, coordinate variables with scientific meaning, or high-concurrency request races. Those are outside the current implementation scope, but they are the first places I would extend testing if this became a production service.
+## Limitations and Future Directions
 
-## Limitations
+### Structural compatibility and scientific meaning
 
-### File format scope
+The merge currently requires same-named dimensions to have the same length. If `part_a` has `time = 2` and `part_b` has `time = 5`, the server does not concatenate, pad, or align the time dimension. It returns an error. Different dimension names can coexist, but the code does not infer that two differently named dimensions might represent the same conceptual axis.
 
-The server accepts NetCDF-4 and NetCDF-4 classic files. NetCDF-3 and CDF-5 are valid NetCDF-family formats, but this server rejects them. The merge path creates a NetCDF-4 output file and is intentionally scoped around NetCDF-4 inputs.
+The implementation also does not align coordinates, reconcile timesteps, regrid data, concatenate along unlimited dimensions, or detect semantic conflicts between coordinate variables. If both files contain a variable with the same name, the first one copied is kept. That behavior is simple and predictable, but it is not necessarily the optimal conflict-resolution strategy.
 
-### Structural compatibility
-
-The merge requires same-named dimensions to have the same length. If `part_a` has `time = 2` and `part_b` has `time = 5`, the server does not concatenate, pad, or align the time dimension. It returns an error. Different dimension names can coexist, but the code does not infer that two differently named dimensions might represent the same conceptual axis.
-
-### Scientific meaning
-
-The implementation does not align coordinates, reconcile timesteps, regrid data, concatenate along unlimited dimensions, or detect semantic conflicts between coordinate variables. If both files contain a variable with the same name, the first one copied is kept. That behavior is simple and predictable, but it is not a scientific conflict-resolution strategy.
+A more complete version could attempt to do these things:
+* For concatenation, the server could allow a user to choose one dimension, such as `time`, as the concat dimension. It would then require every other shared dimension to match exactly, create the output `time` dimension with length `len(part_a.time) + len(part_b.time)`, and write each variable in two slices: the `part_a` values first, then the `part_b` values offset along the concat dimension. Variables that do not use the concat dimension could either be copied once or required to match exactly across both files.
+* For coordinate alignment, the server could inspect coordinate variables like `time`, `lat`, or `lon` before copying data. If both files had the same coordinate values in the same order, it could copy directly. If the values were the same but ordered differently, it could reorder one file's data before writing. If the coordinate sets only partially overlapped, it would need a clear policy: take the union, take the intersection, or fail. That is more involved than checking dimension lengths because it requires comparing actual coordinate variable values, not just dimension metadata.
+* For variable conflicts, the server could utilize a different policy instead of always keeping the first copy. For example, it could rename the second variable as `humidity_part_b`, fail on duplicate variable names, or require the duplicate variables to have identical values before keeping only one. The same kind of policy could apply to duplicate global attributes.
+* Regridding is probably the most challenging thing to attempt as a simple extension because it is not just a NetCDF structural operation. To regrid correctly, the server would need to understand the coordinate reference system, grid topology, interpolation method, missing-value conventions, units, and whether the variable should be interpolated at all. For example, temperature might be interpolated differently from categorical masks or accumulated precipitation. That is a separate scientific-data-processing problem, not just a safer version of the current merge.
 
 ### NetCDF-4 feature coverage
 
-The implementation supports primitive numeric and char variable data. It does not currently support strings, compound types, enum types, opaque types, variable-length arrays, groups, or other advanced NetCDF-4 structures. It also does not preserve or reason about every possible HDF5-level feature that might exist under a NetCDF-4 file.
+The implementation currently supports primitive numeric variables, `NC_CHAR`, and `NC_STRING`. I chose that scope because those types cover the core fixed-size numeric arrays common in NetCDF files, plus string variables, while still keeping the merge implementation understandable and testable.
 
-### Server lifecycle and memory
+Primitive numeric variables and `NC_CHAR` can be copied through a direct byte-buffer path: calculate the element count, multiply by the element size, read the source variable into a temporary byte buffer, and write that buffer into the output variable. `NC_STRING` needs a separate string-specific path, but it is still contained: NetCDF-C provides `nc_get_var_string`, `nc_put_var_string`, and `nc_free_string`.
 
-Uploaded file pairs are stored in memory without expiration. That is fine for this take-home server, but a longer-running service would need request size limits, cleanup for old names, and a more explicit memory budget.
+The unsupported types are different because they require copying type definitions or nested memory structures before the variable data itself can be copied:
+
+- Compound types: these are struct-like user-defined types. Supporting them would require inspecting the compound type definition, recreating it in the output file, preserving field names and offsets, and handling any nested field types before defining variables that use the compound type.
+- Enum types: these are named integer mappings. Supporting them would require copying the enum definition and its members into the output file, then mapping the source enum type ID to the new output type ID before defining enum variables.
+- Opaque types: these store uninterpreted bytes with a defined size. Supporting them would require recreating the opaque type definition in the output file before copying variables of that type.
+- Variable-length types: these cannot be handled as one flat byte buffer. Supporting them would require reading the variable-length descriptors, copying each nested payload, writing the output values, and freeing any C-managed memory correctly.
+- Groups: this implementation only operates at the root dataset level. Supporting groups would require recursively walking the group hierarchy and recreating dimensions, attributes, types, and variables inside each output group.
+- Compression/chunking and lower-level HDF5 layout details: the current merge focuses on logical NetCDF structure and data, not preserving every storage-layout property from the source files.
+
+### Server lifecycle and memory management
+
+Uploaded file pairs are stored in memory without expiration. That doesn't pose any issues for me, but at scale or in production I would have to consider things like request size limits and/or rate limits, cleanup for old names, and a more explicit memory budget. 
+
+To address these considerations, a production version could expire old names after a fixed time window, track current memory usage, and reject new uploads once the server is near its memory budget.
 
 ### Concurrency
 
-The NetCDF-C/HDF5 merge path is serialized. This keeps the implementation safe and easy to reason about, but it means the current version is not designed for high-throughput concurrent merging inside one process.
+The current server allows normal request-level concurrency, but it serializes the NetCDF-C/HDF5 merge itself. That is conservative and safer for this implementation, but it means one large merge can block other merges.
+
+A more advanced version or a production version would need a more deliberate concurrency model, especially per-name coordination for upload/read consistency and process-level isolation for higher-throughput merges. For more detail, see [Parallelism](#parallelism).
+
+### NetCDF-C/HDF5 path probes
+
+The in-memory merge still produced a few failed NetCDF-C/HDF5 path/config lookup attempts in filesystem tracing. These did not read or write the uploaded or merged NetCDF files, but they are worth noting because the trace is not completely silent.
+
+For the full explanation, see [In-Memory Design](#in-memory-design).
 
 ## Resources and Acknowledgments
 
 ### Documentation
 
-* Rocket Programming Guide: `https://rocket.rs/guide`
-* Rocket API documentation: `https://docs.rs/rocket`
-* Rust installation / Cargo: `https://www.rust-lang.org/tools/install`
-* Rust `std::process::Command`: `https://doc.rust-lang.org/std/process/struct.Command.html`
-* Tokio `spawn_blocking`: `https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html`
-* NetCDF-C file and data I/O documentation: `https://docs.unidata.ucar.edu/netcdf-c/current/group__datasets.html`
-* NetCDF-C in-memory support documentation: `https://docs.unidata.ucar.edu/netcdf-c/current/inmemory.html`
-* NetCDF-C `netcdf_mem.h` reference: `https://docs.unidata.ucar.edu/netcdf-c/current/netcdf__mem_8h.html`
-* NetCDF Users Guide: `https://docs.unidata.ucar.edu/nug/current/`
-* HDF5 thread-safe library documentation: `https://support.hdfgroup.org/releases/hdf5/v2_0/v2_0_0/documentation/doxygen/thread-safe-lib.html`
-* HDF5 multi-threading RFC: `https://support.hdfgroup.org/releases/hdf5/documentation/rfc/RFC_multi_thread.pdf`
-* netCDF4 Python documentation: `https://unidata.github.io/netcdf4-python/`
+* [Rocket Programming Guide](https://rocket.rs/guide)
+* [Rocket API documentation](https://docs.rs/rocket)
+* [Rust installation / Cargo](https://www.rust-lang.org/tools/install)
+* [Rust `std::process::Command`](https://doc.rust-lang.org/std/process/struct.Command.html)
+* [Tokio `spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html)
+* [NetCDF-C file and data I/O documentation](https://docs.unidata.ucar.edu/netcdf-c/current/group__datasets.html)
+* [NetCDF-C `nc_open` documentation](https://docs.unidata.ucar.edu/netcdf-c/4.9.3/group__datasets.html#ga019098e9d5265006a11c9a841eb81b74)
+* [NetCDF-C in-memory support documentation](https://docs.unidata.ucar.edu/netcdf-c/current/inmemory.html)
+* [NetCDF-C `netcdf_mem.h` reference](https://docs.unidata.ucar.edu/netcdf-c/current/netcdf__mem_8h.html)
+* [NetCDF-C parallel I/O documentation](https://docs.unidata.ucar.edu/netcdf-c/4.9.3/parallel_io.html)
+* [NetCDF Users Guide](https://docs.unidata.ucar.edu/nug/current/)
+* [netCDF4 Python documentation](https://unidata.github.io/netcdf4-python/)
+* [Rust `netcdf` crate dependencies](https://crates.io/crates/netcdf/0.12.0/dependencies)
+* [HDF5 thread-safe library documentation](https://support.hdfgroup.org/releases/hdf5/v2_0/v2_0_0/documentation/doxygen/thread-safe-lib.html)
+* [HDF5 multi-threading RFC](https://support.hdfgroup.org/releases/hdf5/documentation/rfc/RFC_multi_thread.pdf)
+* [HDF Group thread-safety and concurrent access FAQ](https://confluence.hdfgroup.org/display/knowledge/Questions+about+thread-safety+and+concurrent+access)
+* [Toward Multi-Threaded Concurrency in HDF5](https://www.hdfgroup.org/wp-content/uploads/2022/05/Toward-MT-HDF5.pdf)
+* [PnetCDF](https://parallel-netcdf.github.io/)
 
 ### YouTube
 
-I used YouTube videos while getting oriented with Rust, Rocket, and NetCDF/HDF5 concepts. Specific videos can be added here.
+
+* [Introducing NetCDF and the CF and ACDD conventions](https://www.youtube.com/watch?v=FGHJhAFf1W0)
+* [Async Rust explained in 20 minutes](https://www.youtube.com/watch?v=wXtngLBkK4Q&t=12s)
+* [Rocket - The Rust Web Framework - Hello World](https://www.youtube.com/watch?v=EbU48bdVC60)
+
 
 ### Additional tools
 
-I used LLM assistance while working through Rust syntax, Rocket routing, NetCDF-C calls, HDF5 behavior, comments, tests, and README structure. The hardest parts were understanding how NetCDF-C's memory API actually behaves under the hood, separating real payload disk I/O from library/path-probe noise, and making the Rust/C boundary readable enough that I could explain it later.
+I also used LLM assistance while working through Rust syntax, Rocket routing, NetCDF-C calls, HDF5 behavior, comments, tests, and README structure. 
 
-This was also the fun part of the challenge. I had not worked with Rust or Rocket before, and I had not previously used NetCDF-C's memory API directly. The project forced me to build from examples, docs, filesystem traces, and small test files until the pieces made sense together. I validated the final implementation with generated fixtures, endpoint-level integration tests, `cargo check`, and `cargo test`.
+This was a fun and rewarding challenge, overall. I had not worked with Rust or Rocket before, and I had not previously used NetCDF-C's memory API directly. Building this forced me to move between examples, docs, filesystem traces, and small generated NetCDF files until the pieces fit together. 
