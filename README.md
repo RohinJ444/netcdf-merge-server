@@ -265,7 +265,25 @@ http://127.0.0.1:8000
 
 Keep this terminal running.
 
-### 3. Optional: try the server with your own files using curl
+### 3. Optional: generate Rust documentation
+
+Rust can generate local HTML documentation from the doc comments in `src/main.rs` and `src/merge.rs`:
+
+```bash
+cargo doc --no-deps --open
+```
+
+This builds documentation for this crate only, without generating docs for all dependencies, and opens the generated HTML in your browser.
+
+If you only want to generate the docs without opening them:
+
+```bash
+cargo doc --no-deps
+```
+
+The generated documentation is written under `target/doc/`, which is ignored by Git.
+
+### 4. Optional: try the server with your own files using curl
 
 If you want to test the server manually with your own NetCDF-4 files, open a second terminal and replace the placeholder paths below with the files you want to upload.
 
@@ -298,7 +316,7 @@ Inspect it with `ncdump`:
 ncdump -h <path-to-output-combined.nc>
 ```
 
-### 4. Generate test data files
+### 5. Generate test data files
 
 From the project root:
 
@@ -306,7 +324,7 @@ From the project root:
 python scripts/create_test_data.py
 ```
 
-### 5. Run the integration tests
+### 6. Run the integration tests
 
 With the server still running locally on port 8000:
 
