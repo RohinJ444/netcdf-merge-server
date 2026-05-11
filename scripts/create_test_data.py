@@ -157,6 +157,26 @@ def write_cdf5_file():
         temp = ds.createVariable("temperature", "f4", ("time",))
         temp[:] = np.array([280.0, 281.0], dtype=np.float32)
 
+# Creates NetCDF-4 files with NC_STRING variables
+def write_string_variable_pair():
+    with Dataset(out_dir / "string_a.nc", "w", format="NETCDF4") as ds:
+        ds.createDimension("station", 3)
+
+        names = ds.createVariable("station_name", str, ("station",))
+        names.long_name = "station name"
+        names[:] = np.array(["oakland", "berkeley", "richmond"], dtype=object)
+
+        ds.string_source = "part_a"
+
+    with Dataset(out_dir / "string_b.nc", "w", format="NETCDF4") as ds:
+        ds.createDimension("station", 3)
+
+        labels = ds.createVariable("station_label", str, ("station",))
+        labels.long_name = "station label"
+        labels[:] = np.array(["OAK", "BERK", "RICH"], dtype=object)
+
+        ds.string_source_b = "part_b"
+
 write_standard_pair()
 write_overwrite_part_b()
 write_dimension_conflict_pair()
@@ -166,5 +186,6 @@ write_large_pair()
 write_invalid_file()
 write_netcdf3_file()
 write_cdf5_file()
+write_string_variable_pair()
 
 print(f"Wrote NetCDF test data to {out_dir}/")

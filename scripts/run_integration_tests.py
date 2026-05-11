@@ -311,6 +311,35 @@ def test_large_merge() -> None:
         assert ds.max_temp == 300.0
         assert ds.avg_humidity == 65.0
 
+# Tests that NC_STRING variables are copied correctly.
+def test_string_variables_merge() -> None:
+    upload_pair("string_variables", "string_a.nc", "string_b.nc")
+
+    resp = read_combined("string_variables")
+    assert resp.status_code == 200, resp.text
+
+    out_path = save_response_bytes(resp, "combined_string_variables.nc")
+
+    with Dataset(out_path, "r") as ds:
+        assert set(ds.dimensions.keys()) == {"station"}
+        assert len(ds.dimensions["station"]) == 3
+
+        assert set(ds.variables.keys()) == {"station_name", "station_label"}
+
+        station_name = ds.variables["station_name"]
+        station_label = ds.variables["station_label"]
+
+        assert station_name.shape == (3,)
+        assert station_label.shape == (3,)
+
+        assert station_name.long_name == "station name"
+        assert station_label.long_name == "station label"
+
+        assert list(station_name[:]) == ["oakland", "berkeley", "richmond"]
+        assert list(station_label[:]) == ["OAK", "BERK", "RICH"]
+
+        assert ds.string_source == "part_a"
+        assert ds.string_source_b == "part_b"
 
 def main() -> None:
     tests = [
@@ -326,6 +355,7 @@ def main() -> None:
         test_netcdf3_upload_returns_400,
         test_cdf5_upload_returns_400,
         test_large_merge,
+        test_string_variables_merge,
     ]
 
     for test in tests:

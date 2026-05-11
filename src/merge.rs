@@ -47,6 +47,29 @@ unsafe extern "C" {
     fn nc_close_memio(ncid: c_int, info: *mut NcMemio) -> c_int;
 }
 
+// NetCDF-C string variable API functions.
+unsafe extern "C" {
+    // Reads an NC_STRING variable into C-allocated string pointers.
+    fn nc_get_var_string(
+        ncid: c_int,
+        varid: c_int,
+        data: *mut *mut c_char,
+    ) -> c_int;
+
+    // Writes an NC_STRING variable from string pointers.
+    fn nc_put_var_string(
+        ncid: c_int,
+        varid: c_int,
+        data: *const *const c_char,
+    ) -> c_int;
+
+    // Frees string memory allocated by NetCDF-C.
+    fn nc_free_string(
+        len: usize,
+        data: *mut *mut c_char,
+    ) -> c_int;
+}
+
 /// Safe public entry point for combining two NetCDF-4 files entirely in memory.
 ///
 /// The rest of the server calls this function instead of the unsafe helper below.
@@ -379,10 +402,10 @@ unsafe fn define_variables(
             continue;
         }
 
-        // Currently limiting my implementation to primitive types
+        // Currently limiting my implementation to primitive numeric/char and String types.
         if !is_supported_atomic_type(xtype) {
             return Err(format!(
-                "Variable `{name}` from {label} uses unsupported type {xtype}. This implementation supports primitive numeric/char NetCDF types only."
+                "Variable `{name}` from {label} uses unsupported type {xtype}. This implementation supports primitive numeric/char and string NetCDF types only."
             ));
         }
 
@@ -517,6 +540,37 @@ unsafe fn copy_variable_data(
                 .ok_or_else(|| format!("Variable `{name}` is too large"))?;
         }
 
+        // NC_STRING data is copied through NetCDF-C's string-specific API because
+        // each element is a C string pointer, as opposed to fixed-width inline data.
+        if xtype == netcdf_sys::NC_STRING {
+            let mut strings: Vec<*mut c_char> = vec![ptr::null_mut(); elem_count];
+
+            check_nc(
+                nc_get_var_string(src_ncid, *src_varid, strings.as_mut_ptr()),
+                &format!("Could not read string data for variable `{name}` from {label}"),
+            )?;
+
+            let put_status = nc_put_var_string(
+                dst_ncid,
+                *dst_varid,
+                strings.as_ptr() as *const *const c_char,
+            );
+
+            let free_status = nc_free_string(elem_count, strings.as_mut_ptr());
+
+            check_nc(
+                put_status,
+                &format!("Could not write string data for variable `{name}` to output"),
+            )?;
+
+            check_nc(
+                free_status,
+                &format!("Could not free string data for variable `{name}`"),
+            )?;
+
+            continue;
+        }
+
         // Convert the element count into a byte count, checking for overflow
         let total_bytes = elem_count
             .checked_mul(elem_size)
@@ -629,7 +683,11 @@ unsafe fn nc_type_size(ncid: c_int, xtype: netcdf_sys::nc_type) -> Result<usize,
     Ok(size)
 }
 
-/// Checks whether a NetCDF type is primitive, as I'm only supporting primitive types in this merge implementation.
+/// Checks whether a NetCDF type is supported by this merge implementation.
+///
+/// This implementation supports fixed-width primitive numeric/char types and
+/// NetCDF string variables. Other NetCDF-4 types require additional type-specific
+/// schema or memory handling.
 ///
 /// # Parameters
 ///
@@ -637,7 +695,7 @@ unsafe fn nc_type_size(ncid: c_int, xtype: netcdf_sys::nc_type) -> Result<usize,
 ///
 /// # Returns
 ///
-/// Returns `true` for primitive numeric and char types.
+/// Returns `true` for supported primitive numeric/char and string types.
 fn is_supported_atomic_type(xtype: netcdf_sys::nc_type) -> bool {
     xtype == netcdf_sys::NC_BYTE
         || xtype == netcdf_sys::NC_CHAR
@@ -650,6 +708,7 @@ fn is_supported_atomic_type(xtype: netcdf_sys::nc_type) -> bool {
         || xtype == netcdf_sys::NC_UINT
         || xtype == netcdf_sys::NC_INT64
         || xtype == netcdf_sys::NC_UINT64
+        || xtype == netcdf_sys::NC_STRING
 }
 
 /// Converts a C string pointer into a Rust `String`.
