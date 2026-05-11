@@ -456,7 +456,6 @@ For the full explanation, see [In-Memory Design](#in-memory-design).
 * [HDF5 multi-threading RFC](https://support.hdfgroup.org/releases/hdf5/documentation/rfc/RFC_multi_thread.pdf)
 * [HDF Group thread-safety and concurrent access FAQ](https://confluence.hdfgroup.org/display/knowledge/Questions+about+thread-safety+and+concurrent+access)
 * [Toward Multi-Threaded Concurrency in HDF5](https://www.hdfgroup.org/wp-content/uploads/2022/05/Toward-MT-HDF5.pdf)
-* [PnetCDF](https://parallel-netcdf.github.io/)
 
 ### YouTube
 
