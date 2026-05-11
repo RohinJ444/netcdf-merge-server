@@ -460,14 +460,13 @@ For the full explanation, see [In-Memory Design](#in-memory-design).
 
 ### YouTube
 
-
 * [Introducing NetCDF and the CF and ACDD conventions](https://www.youtube.com/watch?v=FGHJhAFf1W0)
 * [Async Rust explained in 20 minutes](https://www.youtube.com/watch?v=wXtngLBkK4Q&t=12s)
 * [Rocket - The Rust Web Framework - Hello World](https://www.youtube.com/watch?v=EbU48bdVC60)
-
+* [Rust for Dummies in 12 Minutes](https://www.youtube.com/watch?v=0y6RKiIk6cs)
 
 ### Additional tools
 
-I also used LLM assistance while working through Rust syntax, Rocket routing, NetCDF-C calls, HDF5 behavior, comments, tests, and README structure. 
+I also leveraged ChatGPT and Codex while working through Rust syntax, Rocket routing, NetCDF-C calls, HDF5 behavior, comments, tests, and README structure, mainly for debugging, explanation, and drafting support.
 
-This was a fun and rewarding challenge, overall. I had not worked with Rust or Rocket before, and I had not previously used NetCDF-C's memory API directly. Building this forced me to move between examples, docs, filesystem traces, and small generated NetCDF files until the pieces fit together. 
+This was a fun and rewarding challenge, overall. I had not worked with Rust or Rocket before, and I had not previously used NetCDF-C's memory API directly. Building this forced me to move between examples, docs, filesystem traces until the pieces fit together. 
