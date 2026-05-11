@@ -9,6 +9,7 @@ use rocket::State;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use netcdf_reader::{NcFile, NcFormat};
+mod merge;
 
 // Set a maximum file size for each part to prevent crashes from massive files. 
 const MAX_UPLOAD_SIZE_GIB: u64 = 1;
@@ -172,15 +173,10 @@ async fn read_combined(
         .ok_or_else(|| status::BadRequest(format!("Part_b is empty for name={name}")))?;
 
     // Merge
-    let combined = combine_netcdf4_in_memory(part_a, part_b)
+    let combined = merge::combine_netcdf4_in_memory(part_a, part_b)
         .map_err(|e| status::BadRequest(format!("Could not combine NetCDF files for name={name}. Error: {e}")))?;
 
     Ok((ContentType::Binary, combined))
-}
-
-
-fn combine_netcdf4_in_memory(a: &[u8], _b: &[u8]) -> Result<Vec<u8>, String> {
-    Ok(a.to_vec())
 }
 
 #[launch]
