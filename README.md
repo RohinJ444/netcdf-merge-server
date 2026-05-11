@@ -297,8 +297,6 @@ Rust can generate local HTML documentation from the rustdoc comments in `src/mai
 cargo doc --no-deps --open
 ```
 
-This builds documentation for this project without generating documentation pages for every dependency, and opens the generated HTML in your browser.
-
 The generated documentation is written under `target/doc/`, which is ignored by Git.
 
 ### 3. Start the server
