@@ -60,11 +60,11 @@ I describe the lower-level memory flow in more detail in [In-Memory Design](#in-
 
 ### `scripts/create_test_data.py`
 
-`create_test_data.py` generates local NetCDF fixtures under `test_data/`. The generated files are only test inputs, so `test_data/` is ignored by Git.
+`create_test_data.py` generates local NetCDF test files under `test_data/`. The generated files are only test inputs, so `test_data/` is ignored by Git.
 
 ### `scripts/run_integration_tests.py`
 
-`run_integration_tests.py` tests the server through its HTTP API. It uploads generated fixtures, calls `/read`, saves returned files when the merge should succeed, and uses Python's `netCDF4` package to inspect the returned NetCDF contents. For failure cases, it checks that the response is a `400` with plain-text error output rather than a NetCDF/HDF5 payload. For a more detailed overview of the test cases in this script, see [Test Coverage](#test-coverage).
+`run_integration_tests.py` tests the server through its HTTP API. It uploads the previously generated test files, calls `/read`, saves returned files when the merge should succeed, and uses Python's `netCDF4` package to inspect the returned NetCDF contents. For failure cases, it checks that the response is a `400` with plain-text error output rather than a NetCDF/HDF5 payload. For a more detailed overview of the test cases in this script, see [Test Coverage](#test-coverage).
 
 ## API Endpoints
 
@@ -83,7 +83,7 @@ This section offers a brief summary of the available endpoints. For step-by-step
 
 The main implementation constraint was to avoid disk I/O for the uploaded and merged NetCDF files: no saving uploaded files to temporary paths, and no creating the merged output as a temporary file before returning it.
 
-Rust does not provide a NetCDF memory-merge API directly, so the merge uses NetCDF-C's in-memory API through `netcdf_sys`. That API supports the operations needed for the no-payload-disk-I/O constraint: opening an existing NetCDF file from a memory buffer, creating a new output NetCDF file in memory, and retrieving the completed output buffer after closing it.
+Rust does not provide a NetCDF memory-merge API directly, so the merge uses NetCDF-C's in-memory API through `netcdf_sys`. That API supports the operations needed for the no-disk-I/O constraint: opening an existing NetCDF file from a memory buffer, creating a new output NetCDF file in memory, and retrieving the completed output buffer after closing it.
 
 The NetCDF-C functions I used are:
 
@@ -104,7 +104,7 @@ The algorithm for the merge is therefore:
 
 ### Verifying No File Disk I/Os
 
-After implementing and testing `merge.rs`, I wanted to verify that the server was actually meeting the no-payload-disk-I/O constraint. I used macOS filesystem tracing while running the server and issuing upload/read requests:
+After implementing and testing `merge.rs`, I wanted to verify that the server was actually meeting the no-disk-I/O constraint. I used macOS filesystem tracing while running the server and issuing upload/read requests:
 
 
 ```bash
@@ -225,6 +225,46 @@ GET  /read?name=example
 
 The next `/read` returns `part_a.nc + overwrite_b.nc`.
 
+## Parallelism
+
+### Current synchronization model
+
+The current implementation has two separate synchronization points.
+
+First, the upload store is a persisted in-memory `HashMap` protected by a Tokio `RwLock`. That lets Rocket handle normal request-level concurrency: multiple requests can read from the store at the same time, while uploads that modify the store take write access.
+
+Second, the NetCDF-C/HDF5 merge is serialized with a global `Mutex`. Before `combine_netcdf4_in_memory` enters the low-level merge code, it takes that lock, so only one merge can run inside the process at a time.
+
+My decision to select that lock was based on the serialization model described in HDF5's [Thread Safe Library technical note](https://support.hdfgroup.org/releases/hdf5/v2_0/v2_0_0/documentation/doxygen/thread-safe-lib.html). In that model, a thread-safe build of HDF5 installs a recursive mutex around every library entry point, so only one thread is inside the library at a time. The default non-thread-safe build does not provide that protection. Since this server enters NetCDF-C/HDF5 through `netcdf-sys` and cannot assume how the linked HDF5 library was built, the Rust-side lock gives the merge code a consistent safety boundary before any NetCDF-C/HDF5 call.
+
+NetCDF's built-in parallel I/O is a different mechanism. [NetCDF-4 parallel I/O](https://docs.unidata.ucar.edu/netcdf-c/4.9.3/parallel_io.html) is built on HDF5's parallel mode and uses MPI (Message Passing Interface) for coordinated multi-process access to one shared file. That model is useful for HPC jobs where multiple processes collectively write chunks of a large dataset. However, this server has a different problem: each request gives the server two complete in-memory files, and the question is how to handle multiple independent merges safely.
+
+### What can be parallelized
+
+The HTTP side is straightforwardly parallelizable. Rocket can accept multiple connections, read request bodies, validate uploads, store bytes by name, and return response bytes without entering NetCDF-C/HDF5.
+
+The merge side is harder, and this is where HDF5's build configuration matters. HDF5, [documented by the HDF Group](https://confluence.hdfgroup.org/display/knowledge/Questions+about+thread-safety+and+concurrent+access), has three relevant build modes:
+
+- Default builds are not thread-safe at all. Concurrent calls can corrupt internal state, including file ID tables and dimension/variable lookup structures. The HDF Group notes that the pre-built binaries available for download are not thread-safe, which means most general-purpose distributions fall into this bucket unless rebuilt.
+- Thread-safe builds (`--enable-threadsafe`) install the recursive lock described above. Multiple threads can call into HDF5 safely, but only one is actually inside the library at a time. This is functionally equivalent to the explicit `Mutex` I am already using in Rust.
+- Parallel builds (`--enable-parallel`) link against MPI for the HPC use case described above and are not applicable to this server.
+
+So even a thread-safe HDF5 build does not give true concurrency for merges. The HDF Group's own [Toward Multi-Threaded Concurrency in HDF5](https://www.hdfgroup.org/wp-content/uploads/2022/05/Toward-MT-HDF5.pdf) document summarizes the current state plainly: the library is thread-safe but not concurrent. Work to change that is ongoing but is not part of any released version.
+
+Parallelizing within one merge would be even more fragile. NetCDF writes happen in phases: define dimensions and variables, leave define mode, then write data. The output dataset is one shared NetCDF-C/HDF5 object, so parallelizing variable copies would require careful coordination around define mode, IDs, memory ownership, and output mutation order.
+
+### What I would do next
+
+The first improvement I would make is snapshotting by name. When `/read?name=foo` is called, the server should clone the current `part_a` and `part_b` bytes for that name, then release the upload-store lock before running the merge. That would make each read operate on a consistent pair of inputs while keeping the expensive merge work outside the store lock.
+
+The next improvement would be per-name coordination. Uploads and reads for the same `name` should be coordinated, but unrelated names should not block each other at the server-state level. A read of `name=a` should not interfere with an upload to `name=b`.
+
+For true parallel merges, I would use process isolation rather than thread-level parallelism inside one process. Rocket would keep handling HTTP, validation, and upload storage. When a merge is needed, it would send the two byte buffers to a bounded pool of worker processes. Each worker would run one NetCDF-C/HDF5 merge at a time and return the completed bytes. That gives real parallelism across workers without asking multiple Rust threads to share one NetCDF-C/HDF5 library state inside the same process, and it also bounds the impact of any library bug or memory leak to a single worker.
+
+In Rust, that could be built with a small internal worker binary launched through [`std::process::Command`](https://doc.rust-lang.org/std/process/struct.Command.html), or with longer-running local workers communicating over pipes or sockets. A strictly weaker fallback would be [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html), but that would only keep Rocket's async runtime responsive. It would not give parallel merges as long as the global merge lock remains in place.
+
+A longer-running version of this server would also need request size limits, an eviction policy for stale uploads, and a per-name TTL on the store. None of those are concurrency fixes by themselves, but they matter for any server that is expected to stay up.
+
 ## Running, Curl Usage, and Testing
 
 These commands assume you are testing locally on port 8000.
@@ -249,7 +289,19 @@ If you are on macOS and want to inspect returned files with `ncdump`, install th
 brew install netcdf
 ```
 
-### 2. Start the server
+### 2. Optional: generate Rust documentation
+
+Rust can generate local HTML documentation from the rustdoc comments in `src/main.rs` and `src/merge.rs`:
+
+```bash
+cargo doc --no-deps --open
+```
+
+This builds documentation for this project without generating documentation pages for every dependency, and opens the generated HTML in your browser.
+
+The generated documentation is written under `target/doc/`, which is ignored by Git.
+
+### 3. Start the server
 
 From the project root:
 
@@ -265,23 +317,7 @@ http://127.0.0.1:8000
 
 Keep this terminal running.
 
-### 3. Optional: generate Rust documentation
 
-Rust can generate local HTML documentation from the doc comments in `src/main.rs` and `src/merge.rs`:
-
-```bash
-cargo doc --no-deps --open
-```
-
-This builds documentation for this crate only, without generating docs for all dependencies, and opens the generated HTML in your browser.
-
-If you only want to generate the docs without opening them:
-
-```bash
-cargo doc --no-deps
-```
-
-The generated documentation is written under `target/doc/`, which is ignored by Git.
 
 ### 4. Optional: try the server with your own files using curl
 
@@ -331,46 +367,6 @@ With the server still running locally on port 8000:
 ```bash
 python scripts/run_integration_tests.py
 ```
-
-## Parallelism
-
-### Current synchronization model
-
-The current implementation has two separate synchronization points.
-
-First, the upload store is a persisted in-memory `HashMap` protected by a Tokio `RwLock`. That lets Rocket handle normal request-level concurrency: multiple requests can read from the store at the same time, while uploads that modify the store take write access.
-
-Second, the NetCDF-C/HDF5 merge is serialized with a global `Mutex`. Before `combine_netcdf4_in_memory` enters the low-level merge code, it takes that lock, so only one merge can run inside the process at a time.
-
-My decision to select that lock was based on the serialization model described in HDF5's [Thread Safe Library technical note](https://support.hdfgroup.org/releases/hdf5/v2_0/v2_0_0/documentation/doxygen/thread-safe-lib.html). In that model, a thread-safe build of HDF5 installs a recursive mutex around every library entry point, so only one thread is inside the library at a time. The default non-thread-safe build does not provide that protection. Since this server enters NetCDF-C/HDF5 through `netcdf-sys` and cannot assume how the linked HDF5 library was built, the Rust-side lock gives the merge code a consistent safety boundary before any NetCDF-C/HDF5 call.
-
-NetCDF's built-in parallel I/O is a different mechanism. [NetCDF-4 parallel I/O](https://docs.unidata.ucar.edu/netcdf-c/4.9.3/parallel_io.html) is built on HDF5's parallel mode and uses MPI (Message Passing Interface) for coordinated multi-process access to one shared file. That model is useful for HPC jobs where multiple processes collectively write chunks of a large dataset. However, this server has a different problem: each request gives the server two complete in-memory files, and the question is how to handle multiple independent merges safely.
-
-### What can be parallelized
-
-The HTTP side is straightforwardly parallelizable. Rocket can accept multiple connections, read request bodies, validate uploads, store bytes by name, and return response bytes without entering NetCDF-C/HDF5.
-
-The merge side is harder, and this is where HDF5's build configuration matters. HDF5, [documented by the HDF Group](https://confluence.hdfgroup.org/display/knowledge/Questions+about+thread-safety+and+concurrent+access), has three relevant build modes:
-
-- Default builds are not thread-safe at all. Concurrent calls can corrupt internal state, including file ID tables and dimension/variable lookup structures. The HDF Group notes that the pre-built binaries available for download are not thread-safe, which means most general-purpose distributions fall into this bucket unless rebuilt.
-- Thread-safe builds (`--enable-threadsafe`) install the recursive lock described above. Multiple threads can call into HDF5 safely, but only one is actually inside the library at a time. This is functionally equivalent to the explicit `Mutex` I am already using in Rust.
-- Parallel builds (`--enable-parallel`) link against MPI for the HPC use case described above and are not applicable to this server.
-
-So even a thread-safe HDF5 build does not give true concurrency for merges. The HDF Group's own [Toward Multi-Threaded Concurrency in HDF5](https://www.hdfgroup.org/wp-content/uploads/2022/05/Toward-MT-HDF5.pdf) document summarizes the current state plainly: the library is thread-safe but not concurrent. Work to change that is ongoing but is not part of any released version.
-
-Parallelizing within one merge would be even more fragile. NetCDF writes happen in phases: define dimensions and variables, leave define mode, then write data. The output dataset is one shared NetCDF-C/HDF5 object, so parallelizing variable copies would require careful coordination around define mode, IDs, memory ownership, and output mutation order.
-
-### What I would do next
-
-The first improvement I would make is snapshotting by name. When `/read?name=foo` is called, the server should clone the current `part_a` and `part_b` bytes for that name, then release the upload-store lock before running the merge. That would make each read operate on a consistent pair of inputs while keeping the expensive merge work outside the store lock.
-
-The next improvement would be per-name coordination. Uploads and reads for the same `name` should be coordinated, but unrelated names should not block each other at the server-state level. A read of `name=a` should not interfere with an upload to `name=b`.
-
-For true parallel merges, I would use process isolation rather than thread-level parallelism inside one process. Rocket would keep handling HTTP, validation, and upload storage. When a merge is needed, it would send the two byte buffers to a bounded pool of worker processes. Each worker would run one NetCDF-C/HDF5 merge at a time and return the completed bytes. That gives real parallelism across workers without asking multiple Rust threads to share one NetCDF-C/HDF5 library state inside the same process, and it also bounds the impact of any library bug or memory leak to a single worker.
-
-In Rust, that could be built with a small internal worker binary launched through [`std::process::Command`](https://doc.rust-lang.org/std/process/struct.Command.html), or with longer-running local workers communicating over pipes or sockets. A strictly weaker fallback would be [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html), but that would only keep Rocket's async runtime responsive. It would not give parallel merges as long as the global merge lock remains in place.
-
-A longer-running version of this server would also need request size limits, an eviction policy for stale uploads, and a per-name TTL on the store. None of those are concurrency fixes by themselves, but they matter for any server that is expected to stay up.
 
 ## Test Coverage
 
