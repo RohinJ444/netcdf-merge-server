@@ -64,7 +64,7 @@ I describe the lower-level memory flow in more detail in [In-Memory Design](#in-
 
 ### `scripts/run_integration_tests.py`
 
-`run_integration_tests.py` tests the server through its HTTP API. It uploads the previously generated test files, calls `/read`, saves returned files when the merge should succeed, and uses Python's `netCDF4` package to inspect the returned NetCDF contents. For failure cases, it checks that the response is a `400` with plain-text error output rather than a NetCDF/HDF5 payload. For a more detailed overview of the test cases in this script, see [Test Coverage](#test-coverage).
+`run_integration_tests.py` tests the server through its HTTP API. It uploads the previously generated test files, calls `/read`, saves returned files when the merge should succeed, and uses Python's `netCDF4` package to inspect the returned NetCDF contents. For failure cases, it checks that the response is a `400` with plain-text error output. For a more detailed overview of the test cases in this script, see [Test Coverage](#test-coverage).
 
 ## API Endpoints
 
@@ -413,7 +413,7 @@ The unsupported types are different because they require copying type definition
 - Compound types: these are struct-like user-defined types. Supporting them would require inspecting the compound type definition, recreating it in the output file, preserving field names and offsets, and handling any nested field types before defining variables that use the compound type.
 - Enum types: these are named integer mappings. Supporting them would require copying the enum definition and its members into the output file, then mapping the source enum type ID to the new output type ID before defining enum variables.
 - Opaque types: these store uninterpreted bytes with a defined size. Supporting them would require recreating the opaque type definition in the output file before copying variables of that type.
-- Variable-length types: these cannot be handled as one flat byte buffer. Supporting them would require reading the variable-length descriptors, copying each nested payload, writing the output values, and freeing any C-managed memory correctly.
+- Variable-length types: these cannot be handled as one flat byte buffer. Supporting them would require reading the variable-length descriptors, copying each element's data values, writing the output values, and freeing any C-managed memory correctly.
 - Groups: this implementation only operates at the root dataset level. Supporting groups would require recursively walking the group hierarchy and recreating dimensions, attributes, types, and variables inside each output group.
 - Compression/chunking and lower-level HDF5 layout details: the current merge focuses on logical NetCDF structure and data, not preserving every storage-layout property from the source files.
 
